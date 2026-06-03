@@ -1,0 +1,25 @@
+[package]
+name = "sovd-token-helper"
+version = "0.1.0"
+description = "Offboard workshop JWT minter — issues short-lived client→SOVD access tokens"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sovd-token-helper"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["clock"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

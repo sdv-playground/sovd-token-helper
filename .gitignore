@@ -1,0 +1,4 @@
+/target
+# Never commit real signing keys
+*.pem
+*.key
