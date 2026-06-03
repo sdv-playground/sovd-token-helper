@@ -18,6 +18,7 @@ clap = { version = "4", features = ["derive", "env"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 p256 = { version = "0.13", features = ["pkcs8", "pem"] }
 base64 = "0.22"
+pem = "3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["clock"] }
 anyhow = "1"

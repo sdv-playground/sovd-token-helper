@@ -1325,6 +1325,7 @@ dependencies = [
  "clap",
  "jsonwebtoken",
  "p256",
+ "pem",
  "serde",
  "serde_json",
  "tokio",

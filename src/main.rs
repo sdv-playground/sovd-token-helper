@@ -48,6 +48,11 @@ struct Cli {
     /// PKCS#8 (or SEC1) P-256 EC private key (PEM) used to sign tokens.
     #[arg(long, env = "SOVD_MINTER_SIGNING_KEY")]
     signing_key: String,
+    /// PEM cert chain (leaf first, then intermediates), e.g. from
+    /// `scripts/gen-workshop-pki.sh`. Embedded as the JWT `x5c` header so the
+    /// vehicle verifies the chain to its pinned workshop CA.
+    #[arg(long, env = "SOVD_MINTER_CERT_CHAIN")]
+    cert_chain: Option<String>,
     /// `iss` claim — the issuer identifier SOVDd is configured to trust.
     #[arg(long, default_value = "sovd-token-helper")]
     issuer: String,
@@ -75,6 +80,9 @@ struct Signer {
     kid: String,
     issuer: String,
     jwks: serde_json::Value,
+    /// Base64(DER) cert chain (leaf first) for the JWT `x5c` header; empty when
+    /// no chain is configured (connected / JWKS-only mode).
+    x5c: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -89,14 +97,36 @@ struct Claims {
     scope: String,
 }
 
+/// Extract a JWT `x5c` array (base64-DER per cert, leaf first) from a PEM chain.
+fn chain_to_x5c(chain_pem: &str) -> anyhow::Result<Vec<String>> {
+    let blocks = pem::parse_many(chain_pem).context("parse --cert-chain PEM")?;
+    let std_b64 = base64::engine::general_purpose::STANDARD;
+    let certs: Vec<String> = blocks
+        .iter()
+        .filter(|b| b.tag() == "CERTIFICATE")
+        .map(|b| std_b64.encode(b.contents()))
+        .collect();
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "--cert-chain contained no CERTIFICATE blocks"
+    );
+    Ok(certs)
+}
+
 impl Signer {
-    /// Build from a PEM EC private key. Derives the public JWK for `/jwks`.
-    fn from_pem(pem: &str, kid: &str, issuer: &str) -> anyhow::Result<Self> {
-        let encoding_key = EncodingKey::from_ec_pem(pem.as_bytes())
+    /// Build from a PEM EC private key + optional PEM cert chain (leaf first).
+    /// Derives the public JWK for `/jwks`; the chain becomes the `x5c` header.
+    fn new(
+        key_pem: &str,
+        chain_pem: Option<&str>,
+        kid: &str,
+        issuer: &str,
+    ) -> anyhow::Result<Self> {
+        let encoding_key = EncodingKey::from_ec_pem(key_pem.as_bytes())
             .context("parse EC signing key (expected a P-256 PKCS#8 or SEC1 PEM)")?;
 
         // Derive the public key's (x, y) for the published JWK.
-        let secret = p256::SecretKey::from_pkcs8_pem(pem)
+        let secret = p256::SecretKey::from_pkcs8_pem(key_pem)
             .map_err(|e| anyhow!("parse P-256 PKCS#8 private key: {e}"))?;
         let point = secret.public_key().to_encoded_point(false);
         let x = point.x().context("EC public key missing x coordinate")?;
@@ -114,11 +144,17 @@ impl Signer {
             }]
         });
 
+        let x5c = match chain_pem {
+            Some(chain) => chain_to_x5c(chain)?,
+            None => Vec::new(),
+        };
+
         Ok(Self {
             encoding_key,
             kid: kid.to_string(),
             issuer: issuer.to_string(),
             jwks,
+            x5c,
         })
     }
 
@@ -148,6 +184,9 @@ impl Signer {
         };
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(self.kid.clone());
+        if !self.x5c.is_empty() {
+            header.x5c = Some(self.x5c.clone());
+        }
         let token = encode(&header, &claims, &self.encoding_key).context("sign JWT")?;
         Ok((token, exp))
     }
@@ -255,6 +294,7 @@ async fn info(State(st): State<AppState>) -> Json<serde_json::Value> {
         "kid": st.signer.kid,
         "algorithm": "ES256",
         "operator_auth": "bearer (static token)",
+        "x5c_certs": st.signer.x5c.len(),
         "default_ttl_secs": st.default_ttl.as_secs(),
         "max_ttl_secs": st.max_ttl.as_secs(),
     }))
@@ -270,9 +310,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let pem = std::fs::read_to_string(&cli.signing_key)
+    let key_pem = std::fs::read_to_string(&cli.signing_key)
         .with_context(|| format!("read signing key from {}", cli.signing_key))?;
-    let signer = Signer::from_pem(&pem, &cli.kid, &cli.issuer)?;
+    let chain_pem = match &cli.cert_chain {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("read cert chain from {path}"))?,
+        ),
+        None => None,
+    };
+    let signer = Signer::new(&key_pem, chain_pem.as_deref(), &cli.kid, &cli.issuer)?;
 
     let state = AppState {
         signer: Arc::new(signer),
@@ -300,16 +347,43 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // Throwaway P-256 PKCS#8 key — TEST FIXTURE ONLY, never a real signing key.
-    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJYYDLkmSf/w0WeDS
-fjV+rbycc40t9razxoJoZYQylj6hRANCAASMr/PHJFmgiJks/7ljH39vsbfbL/kH
-Hra9IJ6KhCySkFpT5XnQKssJp/rY7rrX8dql45k7x3XcvhcHIaaYHRyr
+    // Throwaway test PKI (from scripts/gen-workshop-pki.sh) — TEST FIXTURES
+    // ONLY. leaf.key signs; leaf.crt + int.crt are the x5c chain (leaf first)
+    // chaining to the OEM Workshop CA.
+    const LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg0f0shY0eYUdamL01
+lY+KDWz0y9nKYHs7KwplnY+T752hRANCAAR49pTZHSd+ggE7+KJOuWYW2OfSOLyL
+cAwP8JERhQ6jpQRX5N3dx6ydnCpWxjqrU2afQhNDj1tN7V/GaL9j9f3p
 -----END PRIVATE KEY-----
+";
+    const LEAF_CRT: &str = "-----BEGIN CERTIFICATE-----
+MIIBlDCCATugAwIBAgIUfVbqOs0W/+MMymiqpYwV+bNgLYgwCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPUmVnaW9uLUVVLVN1YkNBMB4XDTI2MDYwMzE0MzEwNFoXDTI3
+MDYwMzE0MzEwNFowGTEXMBUGA1UEAwwOV29ya3Nob3AtQmF5LTcwWTATBgcqhkjO
+PQIBBggqhkjOPQMBBwNCAAR49pTZHSd+ggE7+KJOuWYW2OfSOLyLcAwP8JERhQ6j
+pQRX5N3dx6ydnCpWxjqrU2afQhNDj1tN7V/GaL9j9f3po2AwXjAMBgNVHRMBAf8E
+AjAAMA4GA1UdDwEB/wQEAwIHgDAdBgNVHQ4EFgQUZjZdhdHkZB4D58vvS0AQMKt+
+W38wHwYDVR0jBBgwFoAUta2HrmG3cb+p0ClF2WxVA6MYh8MwCgYIKoZIzj0EAwID
+RwAwRAIgZfMsu0h0kvWWaSL5yfXAx9L7WKZdm0j1AlY9i3/emP8CIEwXr76+Iz9Y
+6J+wSkgfsnmUGQdz0v+68CgW9dTFvLpH
+-----END CERTIFICATE-----
+";
+    const INT_CRT: &str = "-----BEGIN CERTIFICATE-----
+MIIBmTCCAT+gAwIBAgIUA07s6iSRDhI4refSVvo8NnJwrfUwCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPT0VNLVdvcmtzaG9wLUNBMB4XDTI2MDYwMzE0MzEwNFoXDTMx
+MDYwMjE0MzEwNFowGjEYMBYGA1UEAwwPUmVnaW9uLUVVLVN1YkNBMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEw5NWUViXwxeO1NEuiZMQJxTayZxMkBFR7ZwAk4x3
+AJb8nFEopboFGtr4VD2/4NO9CGyY6gg4fBfGsx62Q5nbcKNjMGEwDwYDVR0TAQH/
+BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFLWth65ht3G/qdApRdls
+VQOjGIfDMB8GA1UdIwQYMBaAFDO7tH5nczIUeFDzRYUrB8o8OGVsMAoGCCqGSM49
+BAMCA0gAMEUCIQDqqoJLopLrgj50KszzJinNN2ExYEvDFTQaMxu18WovTgIgE5T0
+QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
+-----END CERTIFICATE-----
 ";
 
     fn signer() -> Signer {
-        Signer::from_pem(TEST_KEY, "test-kid", "test-issuer").unwrap()
+        let chain = format!("{LEAF_CRT}{INT_CRT}");
+        Signer::new(LEAF_KEY, Some(&chain), "test-kid", "test-issuer").unwrap()
     }
 
     /// The minted token must validate against the SAME JWKS the minter
@@ -400,5 +474,21 @@ Hra9IJ6KhCySkFpT5XnQKssJp/rY7rrX8dql45k7x3XcvhcHIaaYHRyr
         // empty components → empty scope
         let (_t2, _e2) = s.mint("d", &[], "t", Duration::from_secs(60)).unwrap();
         assert!(!token.is_empty());
+    }
+
+    #[test]
+    fn token_header_carries_x5c_chain() {
+        let s = signer();
+        let (token, _) = s
+            .mint("d", &["engine_ecu".to_string()], "t", Duration::from_secs(60))
+            .unwrap();
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        let x5c = header.x5c.expect("x5c chain present in JWT header");
+        assert_eq!(x5c.len(), 2, "leaf + intermediate");
+        // each entry is standard base64 of cert DER; DER starts with 0x30 (SEQUENCE)
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&x5c[0])
+            .unwrap();
+        assert_eq!(der[0], 0x30);
     }
 }

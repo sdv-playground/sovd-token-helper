@@ -1,4 +1,6 @@
 /target
-# Never commit real signing keys
+# Never commit signing keys / generated PKI
 *.pem
 *.key
+*.crt
+/workshop-pki/
