@@ -163,14 +163,20 @@ impl Signer {
         &self,
         device_id: &str,
         components: &[String],
+        verbs: &[String],
         subject: &str,
         ttl: Duration,
     ) -> anyhow::Result<(String, i64)> {
         let now = chrono::Utc::now().timestamp();
         let exp = now + ttl.as_secs() as i64;
+        // `component:<id>` scopes (which components) plus the verb scopes the
+        // device gates on (`reset:execute`, `update:transfer`, …). For a delegated
+        // token these are still bounded at the device by the delegate cert's
+        // granted-rights ceiling — minting a verb is necessary, not sufficient.
         let scope = components
             .iter()
             .map(|c| format!("component:{c}"))
+            .chain(verbs.iter().cloned())
             .collect::<Vec<_>>()
             .join(" ");
         let claims = Claims {
@@ -204,6 +210,20 @@ struct AppState {
     max_ttl: Duration,
 }
 
+/// The verb scopes a workshop token carries when the caller doesn't specify any —
+/// the operational set plus `reset:execute` (the cable-connected ECU reboot). NOT
+/// `factory-reset`, which stays a Tower / online authority (`authorization.md` §5).
+const DEFAULT_WORKSHOP_VERBS: &[&str] = &[
+    "data:read",
+    "data:write",
+    "operations:execute",
+    "modes:set",
+    "update:transfer",
+    "update:execute",
+    "update:verdict",
+    "reset:execute",
+];
+
 #[derive(Deserialize)]
 struct MintRequest {
     /// The vehicle/device id this token is for — becomes the `aud` claim.
@@ -211,6 +231,11 @@ struct MintRequest {
     /// Components the token may access (→ `component:<id>` scopes).
     #[serde(default)]
     components: Vec<String>,
+    /// Verb capabilities the token grants (e.g. `reset:execute`,
+    /// `update:transfer`). Empty → the default workshop set
+    /// (`DEFAULT_WORKSHOP_VERBS`).
+    #[serde(default)]
+    verbs: Vec<String>,
     /// Requested lifetime; clamped to `max_ttl`.
     #[serde(default)]
     ttl_secs: Option<u64>,
@@ -262,7 +287,17 @@ async fn mint(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "workshop-operator".to_string());
 
-    match st.signer.mint(&req.device_id, &req.components, &subject, ttl) {
+    // Default to the workshop's verb set when the caller doesn't narrow it; the
+    // device still caps a delegated token at its cert's granted rights.
+    let verbs: Vec<String> = if req.verbs.is_empty() {
+        DEFAULT_WORKSHOP_VERBS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        req.verbs.clone()
+    };
+    match st.signer.mint(&req.device_id, &req.components, &verbs, &subject, ttl) {
         Ok((token, exp)) => {
             let expires_at = chrono::DateTime::from_timestamp(exp, 0)
                 .map(|d| d.to_rfc3339())
@@ -395,6 +430,7 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
             .mint(
                 "vin:ABC",
                 &["engine_ecu".to_string(), "trans".to_string()],
+                &[],
                 "tech-1",
                 Duration::from_secs(300),
             )
@@ -426,13 +462,45 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
         assert_eq!(data.claims.scope, "component:engine_ecu component:trans");
     }
 
+    /// Verb scopes (the device gates on these) ride in the same `scope` claim,
+    /// after the `component:<id>` scopes.
+    #[test]
+    fn mint_includes_verb_scopes() {
+        let s = signer();
+        let (token, _) = s
+            .mint(
+                "d",
+                &["hsm".to_string()],
+                &["reset:execute".to_string(), "update:transfer".to_string()],
+                "tech",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(s.jwks.clone()).unwrap();
+        let kid = jsonwebtoken::decode_header(&token).unwrap().kid.unwrap();
+        let key = jsonwebtoken::DecodingKey::from_jwk(jwks.find(&kid).unwrap()).unwrap();
+        let mut v = jsonwebtoken::Validation::new(Algorithm::ES256);
+        v.set_audience(&["d"]);
+        v.set_issuer(&["test-issuer"]);
+        v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        #[derive(Deserialize)]
+        struct C {
+            scope: String,
+        }
+        let scope = jsonwebtoken::decode::<C>(&token, &key, &v)
+            .unwrap()
+            .claims
+            .scope;
+        assert_eq!(scope, "component:hsm reset:execute update:transfer");
+    }
+
     /// A token minted for one device must not validate for another (the `aud`
     /// replay guard SOVDd relies on).
     #[test]
     fn token_rejected_for_a_different_device() {
         let s = signer();
         let (token, _) = s
-            .mint("vin:ABC", &["engine_ecu".to_string()], "t", Duration::from_secs(300))
+            .mint("vin:ABC", &["engine_ecu".to_string()], &[], "t", Duration::from_secs(300))
             .unwrap();
         let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(s.jwks.clone()).unwrap();
         let kid = jsonwebtoken::decode_header(&token).unwrap().kid.unwrap();
@@ -467,12 +535,12 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn ttl_is_clamped_and_scopes_render() {
         let s = signer();
         let (token, exp) = s
-            .mint("d", &["a".to_string()], "t", Duration::from_secs(120))
+            .mint("d", &["a".to_string()], &[], "t", Duration::from_secs(120))
             .unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(exp - now <= 120 && exp - now > 60);
         // empty components → empty scope
-        let (_t2, _e2) = s.mint("d", &[], "t", Duration::from_secs(60)).unwrap();
+        let (_t2, _e2) = s.mint("d", &[], &[], "t", Duration::from_secs(60)).unwrap();
         assert!(!token.is_empty());
     }
 
@@ -480,7 +548,7 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn token_header_carries_x5c_chain() {
         let s = signer();
         let (token, _) = s
-            .mint("d", &["engine_ecu".to_string()], "t", Duration::from_secs(60))
+            .mint("d", &["engine_ecu".to_string()], &[], "t", Duration::from_secs(60))
             .unwrap();
         let header = jsonwebtoken::decode_header(&token).unwrap();
         let x5c = header.x5c.expect("x5c chain present in JWT header");
