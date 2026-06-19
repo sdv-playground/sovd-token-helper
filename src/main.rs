@@ -95,6 +95,11 @@ struct Claims {
     jti: String,
     /// Space-delimited `component:<id>` scopes (SOVDd's per-component grammar).
     scope: String,
+    /// §7.1 freshness: binds the token to the device's current boot. Present only
+    /// when the caller supplies it (read live from `x-sumo-boot-id`); the device
+    /// rejects a destructive token whose `boot_id` != its current boot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
 }
 
 /// Extract a JWT `x5c` array (base64-DER per cert, leaf first) from a PEM chain.
@@ -165,6 +170,7 @@ impl Signer {
         components: &[String],
         verbs: &[String],
         subject: &str,
+        boot_id: Option<&str>,
         ttl: Duration,
     ) -> anyhow::Result<(String, i64)> {
         let now = chrono::Utc::now().timestamp();
@@ -187,6 +193,7 @@ impl Signer {
             exp,
             jti: uuid::Uuid::new_v4().to_string(),
             scope,
+            boot_id: boot_id.map(str::to_string),
         };
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(self.kid.clone());
@@ -242,6 +249,11 @@ struct MintRequest {
     /// Technician/subject id; defaults to a generic operator label.
     #[serde(default)]
     subject: Option<String>,
+    /// The device's current boot nonce (read from `x-sumo-boot-id`) — becomes the
+    /// `boot_id` claim binding the token to this boot (§7.1 freshness). Omit for
+    /// no binding (e.g. a non-destructive token).
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -297,7 +309,14 @@ async fn mint(
     } else {
         req.verbs.clone()
     };
-    match st.signer.mint(&req.device_id, &req.components, &verbs, &subject, ttl) {
+    match st.signer.mint(
+        &req.device_id,
+        &req.components,
+        &verbs,
+        &subject,
+        req.boot_id.as_deref(),
+        ttl,
+    ) {
         Ok((token, exp)) => {
             let expires_at = chrono::DateTime::from_timestamp(exp, 0)
                 .map(|d| d.to_rfc3339())
@@ -432,6 +451,7 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
                 &["engine_ecu".to_string(), "trans".to_string()],
                 &[],
                 "tech-1",
+                None,
                 Duration::from_secs(300),
             )
             .unwrap();
@@ -462,6 +482,32 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
         assert_eq!(data.claims.scope, "component:engine_ecu component:trans");
     }
 
+    /// The `boot_id` claim (§7.1 freshness) is present iff the caller supplies it.
+    #[test]
+    fn mint_sets_boot_id_only_when_provided() {
+        let s = signer();
+        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(s.jwks.clone()).unwrap();
+        let mut v = jsonwebtoken::Validation::new(Algorithm::ES256);
+        v.set_audience(&["d"]);
+        v.set_issuer(&["test-issuer"]);
+        v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        let decode = |tok: &str| -> serde_json::Value {
+            let kid = jsonwebtoken::decode_header(tok).unwrap().kid.unwrap();
+            let key = jsonwebtoken::DecodingKey::from_jwk(jwks.find(&kid).unwrap()).unwrap();
+            jsonwebtoken::decode::<serde_json::Value>(tok, &key, &v)
+                .unwrap()
+                .claims
+        };
+        // Provided → the claim binds this boot.
+        let (with, _) = s
+            .mint("d", &[], &[], "t", Some("boot-xyz"), Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(decode(&with)["boot_id"], "boot-xyz");
+        // Omitted → no claim (a non-destructive token isn't boot-bound).
+        let (without, _) = s.mint("d", &[], &[], "t", None, Duration::from_secs(60)).unwrap();
+        assert!(decode(&without).get("boot_id").is_none());
+    }
+
     /// Verb scopes (the device gates on these) ride in the same `scope` claim,
     /// after the `component:<id>` scopes.
     #[test]
@@ -473,6 +519,7 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
                 &["hsm".to_string()],
                 &["reset:execute".to_string(), "update:transfer".to_string()],
                 "tech",
+                None,
                 Duration::from_secs(60),
             )
             .unwrap();
@@ -500,7 +547,7 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn token_rejected_for_a_different_device() {
         let s = signer();
         let (token, _) = s
-            .mint("vin:ABC", &["engine_ecu".to_string()], &[], "t", Duration::from_secs(300))
+            .mint("vin:ABC", &["engine_ecu".to_string()], &[], "t", None, Duration::from_secs(300))
             .unwrap();
         let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(s.jwks.clone()).unwrap();
         let kid = jsonwebtoken::decode_header(&token).unwrap().kid.unwrap();
@@ -535,12 +582,12 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn ttl_is_clamped_and_scopes_render() {
         let s = signer();
         let (token, exp) = s
-            .mint("d", &["a".to_string()], &[], "t", Duration::from_secs(120))
+            .mint("d", &["a".to_string()], &[], "t", None, Duration::from_secs(120))
             .unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(exp - now <= 120 && exp - now > 60);
         // empty components → empty scope
-        let (_t2, _e2) = s.mint("d", &[], &[], "t", Duration::from_secs(60)).unwrap();
+        let (_t2, _e2) = s.mint("d", &[], &[], "t", None, Duration::from_secs(60)).unwrap();
         assert!(!token.is_empty());
     }
 
@@ -548,7 +595,7 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn token_header_carries_x5c_chain() {
         let s = signer();
         let (token, _) = s
-            .mint("d", &["engine_ecu".to_string()], &[], "t", Duration::from_secs(60))
+            .mint("d", &["engine_ecu".to_string()], &[], "t", None, Duration::from_secs(60))
             .unwrap();
         let header = jsonwebtoken::decode_header(&token).unwrap();
         let x5c = header.x5c.expect("x5c chain present in JWT header");
