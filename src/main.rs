@@ -37,7 +37,10 @@ use serde_json::json;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "sovd-token-helper", about = "Offboard workshop JWT minter for SOVD")]
+#[command(
+    name = "sovd-token-helper",
+    about = "Offboard workshop JWT minter for SOVD"
+)]
 struct Cli {
     /// Port to listen on (loopback by default — see --bind-all).
     #[arg(long, default_value = "9200")]
@@ -389,7 +392,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/mint", post(mint))
         .with_state(state);
 
-    let host = if cli.bind_all { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
+    let host = if cli.bind_all {
+        [0, 0, 0, 0]
+    } else {
+        [127, 0, 0, 1]
+    };
     let addr = SocketAddr::from((host, cli.port));
     tracing::info!(%addr, issuer = %cli.issuer, kid = %cli.kid, "sovd-token-helper listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -459,7 +466,9 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
 
         let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(s.jwks.clone()).unwrap();
         let kid = jsonwebtoken::decode_header(&token).unwrap().kid.unwrap();
-        let jwk = jwks.find(&kid).expect("published JWK matches the token kid");
+        let jwk = jwks
+            .find(&kid)
+            .expect("published JWK matches the token kid");
         let key = jsonwebtoken::DecodingKey::from_jwk(jwk).unwrap();
 
         let mut v = jsonwebtoken::Validation::new(Algorithm::ES256);
@@ -500,11 +509,20 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
         };
         // Provided → the claim binds this boot.
         let (with, _) = s
-            .mint("d", &[], &[], "t", Some("boot-xyz"), Duration::from_secs(60))
+            .mint(
+                "d",
+                &[],
+                &[],
+                "t",
+                Some("boot-xyz"),
+                Duration::from_secs(60),
+            )
             .unwrap();
         assert_eq!(decode(&with)["boot_id"], "boot-xyz");
         // Omitted → no claim (a non-destructive token isn't boot-bound).
-        let (without, _) = s.mint("d", &[], &[], "t", None, Duration::from_secs(60)).unwrap();
+        let (without, _) = s
+            .mint("d", &[], &[], "t", None, Duration::from_secs(60))
+            .unwrap();
         assert!(decode(&without).get("boot_id").is_none());
     }
 
@@ -547,7 +565,14 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn token_rejected_for_a_different_device() {
         let s = signer();
         let (token, _) = s
-            .mint("vin:ABC", &["engine_ecu".to_string()], &[], "t", None, Duration::from_secs(300))
+            .mint(
+                "vin:ABC",
+                &["engine_ecu".to_string()],
+                &[],
+                "t",
+                None,
+                Duration::from_secs(300),
+            )
             .unwrap();
         let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(s.jwks.clone()).unwrap();
         let kid = jsonwebtoken::decode_header(&token).unwrap().kid.unwrap();
@@ -582,12 +607,21 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn ttl_is_clamped_and_scopes_render() {
         let s = signer();
         let (token, exp) = s
-            .mint("d", &["a".to_string()], &[], "t", None, Duration::from_secs(120))
+            .mint(
+                "d",
+                &["a".to_string()],
+                &[],
+                "t",
+                None,
+                Duration::from_secs(120),
+            )
             .unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(exp - now <= 120 && exp - now > 60);
         // empty components → empty scope
-        let (_t2, _e2) = s.mint("d", &[], &[], "t", None, Duration::from_secs(60)).unwrap();
+        let (_t2, _e2) = s
+            .mint("d", &[], &[], "t", None, Duration::from_secs(60))
+            .unwrap();
         assert!(!token.is_empty());
     }
 
@@ -595,7 +629,14 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
     fn token_header_carries_x5c_chain() {
         let s = signer();
         let (token, _) = s
-            .mint("d", &["engine_ecu".to_string()], &[], "t", None, Duration::from_secs(60))
+            .mint(
+                "d",
+                &["engine_ecu".to_string()],
+                &[],
+                "t",
+                None,
+                Duration::from_secs(60),
+            )
             .unwrap();
         let header = jsonwebtoken::decode_header(&token).unwrap();
         let x5c = header.x5c.expect("x5c chain present in JWT header");
