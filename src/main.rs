@@ -255,7 +255,11 @@ struct MintRequest {
     /// `aud == its ecu id`; a roster name minted verbatim is rejected with
     /// InvalidAudience.
     device_id: String,
-    /// Components the token may access (→ `component:<id>` scopes).
+    /// Components the token may access (→ `component:<id>` scopes). Empty →
+    /// `component:*` (all components): a token with verb scopes but no
+    /// component scope can't touch anything, which is never what a workshop
+    /// mint means. The device still caps a delegated token at its cert's
+    /// granted rights.
     #[serde(default)]
     components: Vec<String>,
     /// Verb capabilities the token grants (e.g. `reset:execute`,
@@ -400,9 +404,16 @@ async fn mint(
     } else {
         req.verbs.clone()
     };
+    // Same for components: a bare mint means "the workshop bay's full grant",
+    // not a token that can't touch any component.
+    let components: Vec<String> = if req.components.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        req.components.clone()
+    };
     match st.signer.mint(
         &aud,
-        &req.components,
+        &components,
         &verbs,
         &subject,
         req.boot_id.as_deref(),
@@ -804,5 +815,68 @@ mod resolve_aud_tests {
             .await
             .expect_err("404 → 400");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod mint_defaults_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// A bare /mint (no components, no verbs) must produce a USABLE token:
+    /// `component:*` + the workshop verb set — not a token with verbs but no
+    /// component grant.
+    #[tokio::test]
+    async fn bare_mint_defaults_to_component_wildcard() {
+        use p256::pkcs8::{EncodePrivateKey, LineEnding};
+        let mut scalar = [0u8; 32];
+        scalar[31] = 5;
+        let sk = p256::SecretKey::from_bytes(&p256::FieldBytes::from(scalar)).unwrap();
+        let key_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let state = AppState {
+            signer: Arc::new(Signer::new(&key_pem, None, "k1", "test-issuer").unwrap()),
+            operator_token: Arc::new("op".to_string()),
+            default_ttl: Duration::from_secs(60),
+            max_ttl: Duration::from_secs(60),
+            ca_url: None,
+        };
+        let app = Router::new()
+            .route("/mint", axum::routing::post(mint))
+            .with_state(state);
+
+        let ecu = "f".repeat(64);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mint")
+                    .header("authorization", "Bearer op")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        "{{\"device_id\":\"{ecu}\"}}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["aud"], serde_json::json!(ecu));
+
+        // Decode the JWT payload (unverified — shape check only).
+        let token = body["token"].as_str().unwrap();
+        let payload = token.split('.').nth(1).unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64.decode(payload).unwrap()).unwrap();
+        let scope = claims["scope"].as_str().unwrap();
+        assert!(
+            scope.starts_with("component:* "),
+            "bare mint must grant component:*, got scope: {scope}"
+        );
+        assert!(scope.contains("update:execute"));
     }
 }
