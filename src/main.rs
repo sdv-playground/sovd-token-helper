@@ -9,9 +9,13 @@
 //! The device never mints tokens: the minter holds the signing key, signs an
 //! ES256 JWT, and publishes its public key as a JWKS. SOVDd trusts that key
 //! (pre-installed for the offline/workshop case, or fetched when connected) and
-//! validates signature / `aud` (= device id, the replay guard) / `iss` / `exp`,
-//! then authorizes per-component from the `scope` claim
-//! (`component:<id>` / `component:*`).
+//! validates signature / `aud` / `iss` / `exp`, then authorizes per-component
+//! from the `scope` claim (`component:<id>` / `component:*`).
+//!
+//! `aud` is the device's immutable **ecu id** — the 64-hex SHA-256 thumbprint
+//! of its device key's SPKI (what it serves at `x-sumo-id`) — NEVER its Tower
+//! roster name. `/mint` accepts either: an ecu id passes through, a roster
+//! name resolves via Tower 1 (`--ca-url`) or is refused.
 //!
 //! See `tasks/sovdd-token-minter.md` (Phase 2) and `tasks/sovdd-auth-slice.md`.
 
@@ -72,6 +76,13 @@ struct Cli {
     /// Hard cap on token lifetime (requests are clamped to this).
     #[arg(long, default_value = "3600")]
     max_ttl_secs: u64,
+    /// Tower 1 (identity) base URL for resolving a roster NAME to the device's
+    /// immutable ecu id (`GET /devices/{id}` → `ecu_id`). Without it, /mint
+    /// only accepts an ecu id (the 64-hex `x-sumo-id` thumbprint) as
+    /// `device_id` — a roster name would mint a token the device rejects with
+    /// InvalidAudience.
+    #[arg(long, env = "SOVD_MINTER_CA_URL")]
+    ca_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +229,8 @@ struct AppState {
     operator_token: Arc<String>,
     default_ttl: Duration,
     max_ttl: Duration,
+    /// Tower 1 base URL for roster-name → ecu id resolution (`--ca-url`).
+    ca_url: Option<Arc<String>>,
 }
 
 /// The verb scopes a workshop token carries when the caller doesn't specify any —
@@ -236,7 +249,11 @@ const DEFAULT_WORKSHOP_VERBS: &[&str] = &[
 
 #[derive(Deserialize)]
 struct MintRequest {
-    /// The vehicle/device id this token is for — becomes the `aud` claim.
+    /// The device this token is for. Either its immutable ecu id (the 64-hex
+    /// `x-sumo-id` thumbprint — used verbatim as `aud`), or a Tower 1 roster
+    /// name, resolved to the ecu id via `--ca-url`. The DEVICE verifies
+    /// `aud == its ecu id`; a roster name minted verbatim is rejected with
+    /// InvalidAudience.
     device_id: String,
     /// Components the token may access (→ `component:<id>` scopes).
     #[serde(default)]
@@ -263,6 +280,74 @@ struct MintRequest {
 struct MintResponse {
     token: String,
     expires_at: String,
+    /// The `aud` actually minted (the device's ecu id) — echoes the resolution
+    /// so a caller that passed a roster name sees the id the device verifies.
+    aud: String,
+}
+
+/// An ecu id as the device serves it at `x-sumo-id`: 64 hex chars (the SHA-256
+/// thumbprint of its device key's SPKI DER).
+fn is_ecu_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolve the caller-supplied `device_id` to the token `aud` the DEVICE
+/// verifies — its immutable ecu id. A 64-hex id passes through (lowercased to
+/// match the device's rendering); anything else is a roster NAME and resolves
+/// through Tower 1's `GET /devices/{id}` → `ecu_id`. Minting a name verbatim
+/// was the historical aud-mismatch trap: the device rejects the token with
+/// InvalidAudience only after the operator walked away.
+async fn resolve_aud(ca_url: Option<&str>, device_id: &str) -> Result<String, HttpError> {
+    let id = device_id.trim();
+    if is_ecu_id(id) {
+        return Ok(id.to_ascii_lowercase());
+    }
+    let Some(ca) = ca_url else {
+        return Err(http_error(
+            StatusCode::BAD_REQUEST,
+            "device_id is not an ecu id (the 64-hex x-sumo-id thumbprint) and no --ca-url is \
+             configured to resolve roster names — pass the device's x-sumo-id, or start the \
+             minter with --ca-url <tower-1>",
+        ));
+    };
+    let url = format!("{}/devices/{}", ca.trim_end_matches('/'), id);
+    let resp = reqwest::get(&url).await.map_err(|e| {
+        http_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("roster lookup {url} failed: {e}"),
+        )
+    })?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(http_error(
+            StatusCode::BAD_REQUEST,
+            &format!("device '{id}' is not in the Tower 1 roster"),
+        ));
+    }
+    if !resp.status().is_success() {
+        return Err(http_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("roster lookup {url} returned HTTP {}", resp.status()),
+        ));
+    }
+    let device: serde_json::Value = resp.json().await.map_err(|e| {
+        http_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("roster lookup {url}: bad JSON: {e}"),
+        )
+    })?;
+    match device.get("ecu_id").and_then(|v| v.as_str()) {
+        Some(ecu_id) if is_ecu_id(ecu_id) => {
+            tracing::info!(roster_name = %id, %ecu_id, "resolved roster name to ecu id for aud");
+            Ok(ecu_id.to_ascii_lowercase())
+        }
+        _ => Err(http_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "device '{id}' has no ecu id in the roster yet (not enrolled) — enroll it, or \
+                 pass its x-sumo-id directly"
+            ),
+        )),
+    }
 }
 
 type HttpError = (StatusCode, Json<serde_json::Value>);
@@ -291,6 +376,9 @@ async fn mint(
     if req.device_id.trim().is_empty() {
         return Err(http_error(StatusCode::BAD_REQUEST, "device_id is required"));
     }
+    // The aud the DEVICE verifies is its ecu id — resolve a roster name to it
+    // rather than minting a token the device will reject.
+    let aud = resolve_aud(st.ca_url.as_deref().map(String::as_str), &req.device_id).await?;
 
     let ttl = req
         .ttl_secs
@@ -313,7 +401,7 @@ async fn mint(
         req.verbs.clone()
     };
     match st.signer.mint(
-        &req.device_id,
+        &aud,
         &req.components,
         &verbs,
         &subject,
@@ -324,7 +412,11 @@ async fn mint(
             let expires_at = chrono::DateTime::from_timestamp(exp, 0)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_default();
-            Ok(Json(MintResponse { token, expires_at }))
+            Ok(Json(MintResponse {
+                token,
+                expires_at,
+                aud,
+            }))
         }
         Err(e) => {
             tracing::error!(error = %e, "mint failed");
@@ -383,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
         operator_token: Arc::new(cli.operator_token),
         default_ttl: Duration::from_secs(cli.default_ttl_secs),
         max_ttl: Duration::from_secs(cli.max_ttl_secs),
+        ca_url: cli.ca_url.map(Arc::new),
     };
 
     let app = Router::new()
@@ -646,5 +739,70 @@ QKOsCi7I7QyUBCUbBKZYmS2yjJnuk7RO40aKwq0=
             .decode(&x5c[0])
             .unwrap();
         assert_eq!(der[0], 0x30);
+    }
+}
+
+#[cfg(test)]
+mod resolve_aud_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn ecu_id_shape() {
+        assert!(is_ecu_id(&"a".repeat(64)));
+        assert!(is_ecu_id(&"0123456789ABCDEF".repeat(4)));
+        assert!(!is_ecu_id("cvc-host-f3aa8305f4f71800"));
+        assert!(!is_ecu_id(&"a".repeat(63)));
+        assert!(!is_ecu_id(&"g".repeat(64)));
+    }
+
+    /// A 64-hex device_id is the ecu id — used verbatim (lowercased), no
+    /// roster call.
+    #[tokio::test]
+    async fn hex_id_passes_through_lowercased() {
+        let id = "F3AA8305F4F71800254DB937886573CF2052EB2FB5604D93661C60CA881C418C";
+        let aud = resolve_aud(None, id).await.unwrap();
+        assert_eq!(aud, id.to_ascii_lowercase());
+    }
+
+    /// A roster name without --ca-url is refused with an actionable error —
+    /// never minted verbatim (the InvalidAudience trap).
+    #[tokio::test]
+    async fn roster_name_without_ca_url_is_refused() {
+        let err = resolve_aud(None, "cvc-host-f3aa8305f4f71800")
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// A roster name resolves through Tower 1's `GET /devices/{id}` → ecu_id.
+    #[tokio::test]
+    async fn roster_name_resolves_via_tower_1() {
+        let ecu = "f3aa8305f4f71800254db937886573cf2052eb2fb5604d93661c60ca881c418c";
+        let app = Router::new().route(
+            "/devices/{id}",
+            get(
+                move |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    if id == "rig-7" {
+                        Json(serde_json::json!({
+                            "id": "rig-7", "status": "enrolled", "ecu_id": ecu
+                        }))
+                        .into_response()
+                    } else {
+                        (StatusCode::NOT_FOUND, "unknown").into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ca = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        assert_eq!(resolve_aud(Some(&ca), "rig-7").await.unwrap(), ecu);
+
+        let err = resolve_aud(Some(&ca), "rig-8")
+            .await
+            .expect_err("404 → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
