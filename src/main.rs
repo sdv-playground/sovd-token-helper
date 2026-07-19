@@ -234,8 +234,14 @@ struct AppState {
 }
 
 /// The verb scopes a workshop token carries when the caller doesn't specify any —
-/// the operational set plus `reset:execute` (the cable-connected ECU reboot). NOT
-/// `factory-reset`, which stays a Tower / online authority (`authorization.md` §5).
+/// the operational set plus `reset:execute` (the cable-connected ECU reboot) and
+/// `component-admin` (per-component administrative disable/enable — the machine
+/// manager's `x-sumo-admin-state` vendor op). Both are Operational tier: safe to
+/// grant over the workshop cable because they are reversible. NOT `factory-reset`,
+/// which stays a Tower / online authority (`authorization.md` §5). The cloud and
+/// the future onboard minter must NEVER include `component-admin` — a remote
+/// fleet actor must not be able to shut components off outside the
+/// BOM-convergence path.
 const DEFAULT_WORKSHOP_VERBS: &[&str] = &[
     "data:read",
     "data:write",
@@ -245,6 +251,7 @@ const DEFAULT_WORKSHOP_VERBS: &[&str] = &[
     "update:execute",
     "update:verdict",
     "reset:execute",
+    "component-admin",
 ];
 
 #[derive(Deserialize)]
@@ -878,5 +885,31 @@ mod mint_defaults_tests {
             "bare mint must grant component:*, got scope: {scope}"
         );
         assert!(scope.contains("update:execute"));
+    }
+
+    /// The default workshop grant is a governance contract, not a convenience
+    /// list: pin its exact contents so additions are deliberate, and pin that
+    /// `factory-reset` never rides along (Tower / online authority only,
+    /// `authorization.md` §5).
+    #[test]
+    fn default_workshop_verbs_are_pinned() {
+        assert_eq!(
+            DEFAULT_WORKSHOP_VERBS,
+            &[
+                "data:read",
+                "data:write",
+                "operations:execute",
+                "modes:set",
+                "update:transfer",
+                "update:execute",
+                "update:verdict",
+                "reset:execute",
+                "component-admin",
+            ]
+        );
+        assert!(
+            !DEFAULT_WORKSHOP_VERBS.contains(&"factory-reset"),
+            "factory-reset must never be a workshop default"
+        );
     }
 }
