@@ -26,7 +26,7 @@ OPERATOR_TOKEN="${SOVD_MINTER_OPERATOR_TOKEN:?SOVD_MINTER_OPERATOR_TOKEN is requ
 KID="${SOVD_MINTER_KID:-workshop-minter-1}"
 ISSUER="${SOVD_MINTER_ISSUER:-workshop-ca}"
 STATE="${MINTER_STATE_DIR:-/state}"
-SCOPES="${DELEGATE_SCOPES:-reset:execute update:transfer update:execute update:verdict}"
+SCOPES="${DELEGATE_SCOPES:-reset:execute update:transfer update:execute update:verdict component-admin}"
 
 mkdir -p "$STATE"
 
