@@ -26,7 +26,13 @@ OPERATOR_TOKEN="${SOVD_MINTER_OPERATOR_TOKEN:?SOVD_MINTER_OPERATOR_TOKEN is requ
 KID="${SOVD_MINTER_KID:-workshop-minter-1}"
 ISSUER="${SOVD_MINTER_ISSUER:-workshop-ca}"
 STATE="${MINTER_STATE_DIR:-/state}"
-SCOPES="${DELEGATE_SCOPES:-reset:execute update:transfer update:execute update:verdict component-admin}"
+# `data:read` is INCLUDED: §7.9 diagnostics + DID reads (e.g. host.common-rw-usage
+# for disk triage, x-sumo-update-mode probes during a flash) gate on it. It's the
+# device-side CEILING — the delegate cert must grant it or a minted token carrying
+# `data:read` is refused "delegate's certificate does not authorise granting
+# 'data:read'" even though the mint includes it (DEFAULT_WORKSHOP_VERBS). Read-only,
+# so safe over the workshop cable. `data:write` deliberately omitted (mutating).
+SCOPES="${DELEGATE_SCOPES:-data:read reset:execute update:transfer update:execute update:verdict component-admin}"
 
 mkdir -p "$STATE"
 
