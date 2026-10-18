@@ -83,3 +83,7 @@ vehicles.
 > Reference implementation. Operator authentication is a static bearer token here;
 > a real deployment plugs in badge / smartcard / SSO. Bind is loopback by default
 > (`--bind-all` for a dealer-LAN bay service, behind TLS).
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
