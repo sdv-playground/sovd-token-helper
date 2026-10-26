@@ -32,7 +32,7 @@ STATE="${MINTER_STATE_DIR:-/state}"
 # `data:read` is refused "delegate's certificate does not authorise granting
 # 'data:read'" even though the mint includes it (DEFAULT_WORKSHOP_VERBS). Read-only,
 # so safe over the workshop cable. `data:write` deliberately omitted (mutating).
-SCOPES="${DELEGATE_SCOPES:-data:read reset:execute update:transfer update:execute update:verdict component-admin}"
+SCOPES="${DELEGATE_SCOPES:-data:read reset:execute update:transfer update:execute update:verdict operations:execute component-admin}"
 
 mkdir -p "$STATE"
 
